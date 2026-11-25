@@ -504,11 +504,12 @@ final class NotchMusicService: ObservableObject {
         queueActionFailed = false
     }
 
-    /// Petrichor has published nothing readable, so a pending queue request ends.
+    /// Petrichor has published nothing readable (a build without the bridge, or
+    /// no access to its container), so the queue reads as not shared rather than
+    /// as a failed tap.
     func petrichorSnapshotUnavailable() {
         guard queueLoading, NotchPetrichorSupport.owns(playback) else { return }
         queueLoading = false
-        queueActionFailed = true
     }
 
     var upcomingIsHeld: Bool {
