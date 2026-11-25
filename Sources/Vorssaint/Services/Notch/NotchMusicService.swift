@@ -89,7 +89,7 @@ final class NotchMusicService: ObservableObject {
     private let queue = DispatchQueue(label: "com.vorssaint.notch-music", qos: .utility)
     private lazy var commandWriter = NotchMusicCommandWriter { [queue = self.queue] action in queue.async(execute: action) }
 
-    private init() {}
+    private init() { NotchPetrichorClient.shared.install() }
 
     private static var adapter: [String]? {
         guard let script = Bundle.main.url(forResource: "now-playing", withExtension: "pl"),
@@ -285,6 +285,7 @@ final class NotchMusicService: ObservableObject {
         awaitingPlayback = false
         updateAutomation(for: reading.playback)
         NotchLyricsService.shared.playbackChanged(reading.playback)
+        NotchPetrichorSupport.notePlayback(reading.playback)
         updateQueue()
     }
 
@@ -395,6 +396,7 @@ final class NotchMusicService: ObservableObject {
         cancelAutomationAction()
         commandWriter.stop()
         queueVisible = false
+        NotchPetrichorSupport.notePlayback(nil)
         NotchLyricsService.shared.hide()
         NotchBrowserArtwork.shared.cancel()
         queueRequest = nil
@@ -447,13 +449,14 @@ final class NotchMusicService: ObservableObject {
         awaitingPlayback = true
         updateAutomation(for: nil)
         NotchLyricsService.shared.playbackChanged(nil)
+        NotchPetrichorSupport.notePlayback(nil)
     }
 
     func setQueueVisible(_ visible: Bool) {
         queueVisible = visible && NotchQueueSupport.isEnabled() && playback != nil
         guard queueVisible else {
             commandWriter.setQueueRequest(nil)
-            if queueRequest != nil { send(.queueStop) }
+            if queueRequest != nil, !NotchPetrichorSupport.owns(playback) { send(.queueStop) }
             queueRequest = nil
             queueReply = nil
             upcoming = nil
@@ -476,17 +479,41 @@ final class NotchMusicService: ObservableObject {
         guard queueVisible, NotchQueueSupport.isEnabled(), playback != nil else { return }
         let request = UUID()
         queueRequest = request
-        commandWriter.setQueueRequest(request)
         queueReply = nil
         upcoming = nil
         queueLoading = true
         queueActionFailed = false
         queueActionPending = false
+        if NotchPetrichorSupport.owns(playback) {
+            commandWriter.setQueueRequest(nil)
+            NotchPetrichorClient.shared.reload()
+            return
+        }
+        commandWriter.setQueueRequest(request)
         if !send(.queue(request)) { queueLoading = false; queueActionFailed = true }
+    }
+
+    func applyPetrichorSnapshot(_ snapshot: NotchPetrichorSupport.Snapshot) {
+        guard queueVisible, NotchQueueSupport.isEnabled(), let playback, NotchPetrichorSupport.owns(playback) else { return }
+        if queueRequest == nil { queueRequest = UUID() }
+        guard let request = queueRequest,
+              let next = NotchPetrichorSupport.queue(from: snapshot, playback: playback, requestID: request) else { return }
+        upcoming = next
+        queueLoading = false
+        queueActionPending = false
+        queueActionFailed = false
+    }
+
+    /// Petrichor has published nothing readable, so a pending queue request ends.
+    func petrichorSnapshotUnavailable() {
+        guard queueLoading, NotchPetrichorSupport.owns(playback) else { return }
+        queueLoading = false
+        queueActionFailed = true
     }
 
     var upcomingIsHeld: Bool {
         guard let upcoming else { return false }
+        if NotchPetrichorSupport.owns(playback) { return upcoming.pid != playback?.track.appPID }
         return upcoming.currentIdentifier != playback?.itemIdentifier || upcoming.pid != playback?.track.appPID
     }
 
@@ -495,11 +522,15 @@ final class NotchMusicService: ObservableObject {
     }
 
     func playQueued(_ item: NotchQueueItem) {
-        guard queueVisible, NotchQueueSupport.isEnabled(), let request = queueRequest, let upcoming,
-              let playback, upcoming.currentIdentifier == playback.itemIdentifier,
+        guard queueVisible, NotchQueueSupport.isEnabled(), let upcoming, let playback,
               upcoming.pid == playback.track.appPID, upcoming.canPlay,
               upcoming.items.contains(where: { $0.id == item.id && $0.offset == item.offset }),
               !queueActionPending else { return }
+        if NotchPetrichorSupport.owns(playback) {
+            queueActionFailed = !NotchPetrichorSupport.requestPlay(item)
+            return
+        }
+        guard let request = queueRequest, upcoming.currentIdentifier == playback.itemIdentifier else { return }
         queueActionFailed = false
         queueActionPending = true
         let selected = NotchQueueSelection(requestID: request, pid: upcoming.pid,
@@ -520,6 +551,8 @@ final class NotchMusicService: ObservableObject {
     }
 
     private func updateQueue() {
+        // Petrichor's rows come from its snapshot, not from a MediaRemote reply.
+        if NotchPetrichorSupport.owns(playback) { return }
         guard let request = queueRequest, let playback, let queueReply, NotchQueueSupport.isEnabled() else {
             upcoming = nil
             return

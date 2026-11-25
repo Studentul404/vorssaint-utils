@@ -21,6 +21,7 @@ final class NotchLyricsService: ObservableObject {
     private var artistCache: [String: (identity: NotchLyricsSupport.ArtistIdentity?, failed: Bool, expires: Date)] = [:]
     private var aliasWork: DispatchWorkItem?
     private var lastAliasRequest: TimeInterval = 0
+    private var external: (track: NotchMusicIdentity, lyrics: NotchLyrics)?
     private var importPanel: NSOpenPanel?
     var isImporting: Bool { importPanel != nil }
 
@@ -41,6 +42,24 @@ final class NotchLyricsService: ObservableObject {
         if lyrics != nil { state = .ready; return }
         guard online else { state = .consent; return }
         load(track)
+    }
+
+    /// Lyrics a player publishes itself (Petrichor's bridge). They need no online
+    /// lookup, and an unchanged republish must not discard a manual import or offset.
+    func applyExternal(_ lyrics: NotchLyrics, for playback: NotchPlayback) {
+        guard NotchLyricsSupport.isEnabled() else { return }
+        let next = NotchMusicIdentity(playback)
+        if next != track {
+            cancel()
+            memory.select(next)
+            settledAttempt = nil
+        }
+        if let external, external.track == next, external.lyrics == lyrics, self.lyrics != nil { return }
+        cancel()
+        guard memory.replace(lyrics, for: next) else { return }
+        external = (next, lyrics)
+        settledAttempt = nil
+        state = .ready
     }
 
     /// Called for actual adapter metadata, including an explicit empty snapshot.
