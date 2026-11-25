@@ -604,6 +604,7 @@ enum NotchMusicExtrasTests {
         NotchLyricsCorpusTests.run(suite)
         browserArtworkContracts(suite)
         NotchMusicHardeningTests.run(suite)
+        petrichorBridge(suite)
         let track = RadialNowPlayingSnapshot(title: "A & B + C", artist: "Artist / Example", album: "Studio Recording",
                                             artworkData: nil, appBundleIdentifier: "org.example.player", appPID: 42)
         var playback = NotchPlayback(track: track, isPlaying: true, elapsed: 0, duration: 180, rate: 1,
@@ -901,5 +902,83 @@ enum NotchMusicExtrasTests {
             suite.expect(strings.count == 45 && strings.allSatisfy { !$0.isEmpty && !$0.contains("—") },
                    "music extras have complete user-facing strings in \(language.rawValue)")
         }
+    }
+
+    private static func petrichorBridge(_ suite: TestSuite) {
+        let home = URL(fileURLWithPath: "/Users/example")
+        let debug = "org.Petrichor.debug"
+        suite.expect(NotchPetrichorSupport.owns(petrichorPlayback(bundle: debug, pid: 9, item: nil))
+               && NotchPetrichorSupport.owns(petrichorPlayback(bundle: "org.Petrichor", pid: 9, item: "x"))
+               && !NotchPetrichorSupport.owns(petrichorPlayback(bundle: "com.spotify.client", pid: 9, item: "x"))
+               && !NotchPetrichorSupport.owns(nil),
+               "only Petrichor's Now Playing session uses the file bridge")
+        let urls = NotchPetrichorSupport.candidateURLs(bundleIdentifier: debug, home: home,
+                                                       notifiedPath: "/tmp/vorssaint-bridge.json")
+        suite.expect(urls.first?.path == "/tmp/vorssaint-bridge.json"
+               && urls.contains { $0.path.contains("Library/Containers/\(debug)/") }
+               && urls.contains { $0.path.hasSuffix("Library/Application Support/\(debug)/vorssaint-bridge.json") },
+               "the helper looks in the notification path and Petrichor's sandbox container")
+        suite.expect(NotchPetrichorSupport.candidateURLs(bundleIdentifier: "com.spotify.client", home: home).isEmpty,
+               "another player's bundle never selects Petrichor's snapshot file")
+        suite.expect(NotchPetrichorSupport.notifiedPath(from: ["path": "/tmp/vorssaint-bridge.json"]) == "/tmp/vorssaint-bridge.json"
+               && NotchPetrichorSupport.notifiedPath(from: ["path": "/etc/hosts"]) == nil
+               && NotchPetrichorSupport.notifiedPath(from: ["path": "bad\0path"]) == nil
+               && NotchPetrichorSupport.notifiedPath(from: [:]) == nil,
+               "the snapshot path from the distributed notification is bounded")
+
+        let payload: [String: Any] = [
+            "version": 1, "bundleIdentifier": debug, "currentIndex": 1,
+            "current": ["index": 1, "title": "Playing", "artist": "Band", "duration": 180.0],
+            "lyrics": ["timed": true, "instrumental": false, "plain": "One\nTwo",
+                       "lines": [["time": 0.0, "text": "One"], ["time": 12.5, "text": "Two"]]],
+            "queue": [
+                ["index": 0, "title": "Earlier", "artist": "Band", "duration": 90.0],
+                ["index": 1, "title": "Playing", "artist": "Band", "duration": 180.0],
+                ["index": 2, "title": "Next", "artist": "Band", "duration": 200.0]
+            ]
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: payload)
+        let snapshot = NotchPetrichorSupport.decode(data)
+        suite.expect(snapshot?.currentIndex == 1 && snapshot?.queue.count == 3 && snapshot?.lyrics?.timed == true,
+               "a versioned Petrichor snapshot round-trips current song, lyrics and queue")
+        let playback = petrichorPlayback(bundle: debug, pid: 11, item: nil)
+        let request = UUID()
+        let queue = snapshot.flatMap { NotchPetrichorSupport.queue(from: $0, playback: playback, requestID: request) }
+        suite.expect(queue?.items.map(\.title) == ["Next"] && queue?.canPlay == true
+               && queue?.items.map(\.offset) == [1]
+               && queue?.items.first?.id == NotchPetrichorSupport.itemIdentifier(index: 2),
+               "upcoming rows keep Petrichor's queue indexes and stay playable without MediaRemote command 131")
+        suite.expect(NotchPetrichorSupport.playIndex(from: queue!.items[0]) == 2
+               && NotchPetrichorSupport.playIndex(from: NotchQueueItem(id: "native", offset: 1, title: "X",
+                                                                      artist: "", duration: 0)) == nil,
+               "a queue tap names Petrichor's original index, not a native content item")
+        let lyrics = snapshot.flatMap(NotchPetrichorSupport.lyrics(from:))
+        suite.expect(lyrics?.lines.map(\.text) == ["One", "Two"] && lyrics?.lines.last?.time == 12.5
+               && lyrics?.plain == "One\nTwo" && lyrics?.instrumental == false,
+               "timed lyrics from Petrichor are shown without an LRCLIB lookup")
+
+        var plain = payload
+        plain["lyrics"] = ["timed": false, "instrumental": false, "plain": "Verse text", "lines": [] as [[String: Any]]]
+        let unsynced = (try? JSONSerialization.data(withJSONObject: plain)).flatMap(NotchPetrichorSupport.decode)
+        suite.expect(NotchPetrichorSupport.lyrics(from: unsynced!)?.lines.isEmpty == true
+               && NotchPetrichorSupport.lyrics(from: unsynced!)?.plain == "Verse text",
+               "untimed Petrichor lyrics still appear as plain text")
+
+        var other = payload
+        other["bundleIdentifier"] = "com.apple.Music"
+        suite.expect((try? JSONSerialization.data(withJSONObject: other)).flatMap(NotchPetrichorSupport.decode) == nil,
+               "a snapshot that does not name Petrichor is ignored")
+        suite.expect(snapshot.flatMap {
+            NotchPetrichorSupport.queue(from: $0, playback: petrichorPlayback(bundle: "com.spotify.client", pid: 11, item: nil),
+                                        requestID: request)
+        } == nil, "Spotify cannot inherit Petrichor's published queue")
+    }
+
+    private static func petrichorPlayback(bundle: String, pid: Int32, item: String?) -> NotchPlayback {
+        let track = RadialNowPlayingSnapshot(title: "Playing", artist: "Band", album: nil, artworkData: nil,
+                                             appBundleIdentifier: bundle, appPID: pid)
+        return NotchPlayback(track: track, isPlaying: true, elapsed: 0, duration: 180, rate: 1,
+                             sampledAt: Date(timeIntervalSinceReferenceDate: 0), canSeek: true,
+                             itemIdentifier: item, canSendCommandsDirectly: false)
     }
 }
